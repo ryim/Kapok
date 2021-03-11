@@ -1,0 +1,324 @@
+#!/usr/bin/perl
+use warnings;
+use strict;
+use FindBin;
+use lib "$FindBin::RealBin/Kapok-lib";
+use MyTimeBits;
+use CheckDependencies;
+use SampleSheetReader;
+use KapokLogUtils;
+use KapokJobSubmitter;
+use KapokStepsUtils;
+use Getopt::Long;
+use GeneralUtils;
+Getopt::Long::Configure ("bundling");
+
+################################################################################
+#   Configuration, idiotproofing, and options parsing                          #
+################################################################################
+
+#   Set up help string. This is what's printed if there are errors.
+my $helpstring = 
+    "Usage: kapok <-i /input/directory/path> "
+    ."<-s sample_sheet.csv> <-p pipeline_steps_file.txt>\n"
+    ."[-v] [-f]\n"
+    ."-d, --dev_mode        Check the pipeline file periodically. If the file\n"
+    ."                      changes, run the new pipeline.\n"
+    ."--dummy               Don't actually submit jobs. Write that a job has\n"
+    ."                      exited successfully, into the log.\n"
+    ."-f, --rerun_fails     If a step has a non-zero exit code, keep trying.\n"
+    ."-h, --help            Output a usage message and exit.\n"
+    ."-i, --in_dir          Location of input files.\n"
+    ."-p, --pipeline_steps  File containing list of steps in the pipeline.\n"
+    ."-s, --sample_sheet    TSV file containing USIDs.\n"
+    ."-t, --check_interval  Time between checks of the queue, in seconds.\n"
+    ."                      [900]\n"
+    ."-u, --utilities_dir   Location of utility files for step scripts to \n"
+    ."                      look for useful files in, such as BED files.\n"
+    ."                      This defaults to the value specified by --in_dir.\n"
+    ."-v, --verbose         Increase reporting to STDOUT.\n"
+    ."Incomplete.\n"
+;
+
+#   Define variables to store command line options in
+my $help = 0;
+my $verbose = 0;
+my $samplesheet;
+my $indir;
+my $stepsfile;
+my $rerunfails;
+my $utilitiesdir;
+my $devmode = 0;
+my $dummy = 0;
+my $interval = 15*60;
+
+#   Get command line options
+GetOptions(
+            "h|help" => \$help,
+            "i|in_dir=s" => \$indir,
+            "p|pipeline_steps=s" => \$stepsfile,
+            "s|sample_sheet=s" => \$samplesheet,
+            "f|rerun_fails" => \$rerunfails,
+            "u|utilities_dir=s" => \$utilitiesdir,
+            "d|dev_mode" => \$devmode,
+            "dummy" => \$dummy,
+            "t|check_interval=s" => \$interval,
+            "v|verbose" => \$verbose
+);
+
+#   If help is requested in the command line options, send it.
+if ($help == 1) {
+    print $helpstring;
+    exit(0);
+}
+
+#   General idiotproofing
+my $todie = 0;
+if (! $samplesheet) {
+    print "Fatal error: Missing sample sheet argument.\n";
+    $todie = 1;
+}
+if (! $indir) {
+    print "Fatal error: Missing input directory argument.\n";
+    $todie = 1;
+}
+if (! $stepsfile) {
+    print "Fatal error: Missing pipeline steps file argument.\n";
+    $todie = 1;
+}
+if (! -e $stepsfile) {
+    print "Fatal error: Pipeline steps file not found at:\n$stepsfile\n";
+    $todie = 1;
+}
+if (! -e $samplesheet) {
+    print "Fatal error: Samplesheet not found at:\n$samplesheet\n";
+    $todie = 1;
+}
+if (! -e $indir) {
+    print "Fatal error: Input directory not found at:\n$indir\n";
+    $todie = 1;
+}
+if ($interval =~ m/\D/ || $interval !~ m/\d/) {
+    print "Fatal error: Specified interval is not a positive integer.\n";
+    $todie = 1;
+}
+
+if ($todie == 1) {
+    print $helpstring;
+    exit(1);
+}
+
+#   Warnings
+if ($interval > 3 * 60 * 60) {
+    print "Warning: Specified check interval is over 3 hours.\n";
+}
+
+#   Assemble default values
+$utilitiesdir = $indir if (! $utilitiesdir);
+
+################################################################################
+#   The meat of the script                                                     #
+################################################################################
+
+#   Read steps list into array
+my @steplist = stepsfile2stepslist($stepsfile);
+
+#   Prep and global variables
+(my $rootdir = $FindBin::RealBin) .= '/';
+checkdependencies($rootdir, @steplist);
+$indir =~ s/\/$//;
+my $logfile = "$indir/Kapok.log";
+my $username = getpwuid( $< );
+
+#   Read sample sheet, and get a list of sample runIDs
+my @usids = samplesheet2USIDs($samplesheet);
+
+if ($verbose) {
+    foreach my $usid (@usids) {
+        print "USID found: $usid\n";
+    }
+}
+
+#   Generate an array, at each step, of all previous steps in list
+my @prevsteps = stepslist2prevsteps(@steplist);
+
+#   Start a while loop (while there is a sample in the pipeline)
+while (@usids) {
+
+    #   Prep at the start of each loop
+    my $timestring = ymd_hms();
+    print "==================== [$timestring] ====================\n";
+
+    #   If in dev mode, create new steplist and prevsteps arrays from the file
+    if ($devmode) {
+        #   Keep an archive of the old steplist
+        my @oldsteplist = @steplist;
+
+        #   Load new steplist and prevsteps arrays
+        @steplist = stepsfile2stepslist($stepsfile);
+        @prevsteps = stepslist2prevsteps(@steplist);
+
+        #   If the steplist has changed, restart analysis of all samples
+        my $identical = identicalarraycheck(\@oldsteplist, \@steplist);
+        if (! $identical) {
+            @usids = samplesheet2USIDs($samplesheet);
+        }
+
+        undef @oldsteplist;
+        undef $identical;
+    }
+
+    #   Keep a list of USIDs which have reached the end of their processing with
+    #   this pipeline. These will be removed at each iteration of the while loop
+    my @usidstoremove;
+
+    #   Read queue into a hash, with job names containing step name and runID as
+    #   keys. Values don't matter, and are set as '1'
+    #   If dummy run active, don't check the queue
+    my %queue;
+    if (! $dummy) {
+        %queue = map { $_ => '1' } split(/\n/, `squeue -h -u $username -o %j`);
+    }
+
+    #   If verbosity flag set, print all jobs with your username in queue
+    if ($verbose) {
+        foreach my $key (keys(%queue)) {
+            print "Job in queue: $key\n";
+        }
+    }
+
+    #   Read log into array of steps, corresponding to steps array, each element
+    #   containing a hash of runID => exit code. Keep only the latest instance
+    #   of each exit code.
+    my @exitcodes = log2exitcodes($logfile, \@steplist, \@prevsteps);
+
+    #   If verbosity flag set, print all latest exit codes from all steps
+    if ($verbose) {
+        print scalar(@exitcodes) . " steps found with exit codes in log.\n";
+        print "Latest exit codes in log:\n";
+        for (my $step = 0; $step < scalar(@exitcodes); $step ++) {
+            my %hash = %{$exitcodes[$step]};
+            foreach my $key (keys(%{hash})) {
+                print "Step_$step\t$steplist[$step]\t$key\t$hash{$key}\n";
+            }
+        }
+        print "====================\n";
+    }
+
+    #   For each USID
+    for (my $usidindex = 0; $usidindex < scalar(@usids); $usidindex ++) {
+    my $usid = $usids[$usidindex];
+
+        #   Loop through steps
+        for (my $step = 0; $step <= scalar(@exitcodes); $step ++) {
+
+            #   Check the log for the latest exit code for this step and runID
+            #   If exit code is not defined
+            if (! defined($exitcodes[$step]{$usid})) {
+
+                checkqueueandrun(
+                    $step, 
+                    $prevsteps[$step], 
+                    $steplist[$step], 
+                    $indir, 
+                    $rootdir, 
+                    $usid,
+                    $logfile,
+                    $utilitiesdir,
+                    $dummy,
+                    %queue
+                );
+
+                last;
+
+            }
+            #   elsif exit code is a 0
+            elsif ($exitcodes[$step]{$usid} == 0) {
+
+                #   If this is the last step, and exit code is 0
+                if ($step == scalar(@steplist) - 1) {
+                    print "Last step reached for $usid.\n";
+
+                    #   Remove the USID from the list of sample USIDs
+                    push(@usidstoremove, $usidindex);
+                    last;
+                }
+                #   If not the last step
+                else {
+
+                    #   Skip to next step
+                    next;
+                }
+            }
+            #   Elsif exit code is non-zero
+            else {
+
+                #   Throw an warning to STDOUT if it's not running
+                print "Warning: Non-zero exit code: $exitcodes[$step]{$usid} "
+                    ."for $usid in step: $steplist[$step]\n";
+
+                #   If flag set to rerun steps with non-zero exit codes, do it
+                if ($rerunfails) {
+                    print "Retrying $steplist[$step] for $usid.\n";
+
+                    checkqueueandrun(
+                        $step, 
+                        $prevsteps[$step], 
+                        $steplist[$step], 
+                        $indir, 
+                        $rootdir, 
+                        $usid,
+                        $logfile,
+                        $utilitiesdir,
+                        $dummy,
+                        %queue
+                    );
+                }
+                else {
+                    print "--rerun_fails flag not set. $usid not rerun.\n";
+                }
+
+                #   Break out of steps loop
+                last;
+
+            }
+        }
+    }
+
+    #   Sort the USIDs in descending order, so the splices work
+    #   Remove USIDs which have reached the end of their processing.
+    @usidstoremove = sort { $b <=> $a } @usidstoremove;
+    foreach my $toremove (@usidstoremove) {
+
+        if ($verbose) {
+            print "Removing index from USID array: $toremove\n";
+        }
+
+        splice(@usids, $toremove, 1);
+    }
+
+    #   Wait for the defined interval, if there are still samples to run.
+    sleep($interval);
+}
+
+#   Once all samples in the USID list are gone, tell the STDOUT and exit
+print "====================\n"
+    ."Finishing because no more samples with steps to run.\n"
+    ."Check the Kapok.log file for errors.\n"
+    ."Have a nice day!\n";
+
+################################################################################
+#                                                                              #
+#   Copyright:
+#   This Source Code Form is subject to the terms of the Mozilla Public
+#   License, v. 2.0. If a copy of the MPL was not distributed with this
+#   file, You can obtain one at https://mozilla.org/MPL/2.0/.
+#
+#   Contributors: Richard Yim*
+#
+#  *Centre for Cancer
+#   Faculty of Medical Sciences
+#   Newcastle University
+#   UK
+#                                                                              #
+################################################################################
